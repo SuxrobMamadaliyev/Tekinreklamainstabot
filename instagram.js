@@ -1,5 +1,6 @@
 const { IgApiClient } = require('instagram-private-api');
 const Session = require('./sessionModel');
+const queue = require('./queue');
 
 const ig = new IgApiClient();
 let isLoggedIn = false;
@@ -52,18 +53,30 @@ async function reloginIfNeeded(fn) {
   }
 }
 
-async function postPhoto(imageBuffer, caption = '') {
-  if (!isLoggedIn) await loginInstagram();
-  return reloginIfNeeded(() =>
-    ig.publish.photo({ file: imageBuffer, caption })
-  );
+// Postlash amallari navbat orqali ketma-ket bajariladi — bir vaqtda
+// koʻplab foydalanuvchi yuborsa ham Instagram sessiyasi buzilmaydi.
+
+function postPhoto(imageBuffer, caption = '') {
+  return queue.push(async () => {
+    if (!isLoggedIn) await loginInstagram();
+    return reloginIfNeeded(() =>
+      ig.publish.photo({ file: imageBuffer, caption })
+    );
+  });
 }
 
-async function postVideo(videoBuffer, coverBuffer, caption = '') {
-  if (!isLoggedIn) await loginInstagram();
-  return reloginIfNeeded(() =>
-    ig.publish.video({ video: videoBuffer, coverImage: coverBuffer, caption })
-  );
+function postVideo(videoBuffer, coverBuffer, caption = '') {
+  return queue.push(async () => {
+    if (!isLoggedIn) await loginInstagram();
+    return reloginIfNeeded(() =>
+      ig.publish.video({ video: videoBuffer, coverImage: coverBuffer, caption })
+    );
+  });
 }
 
-module.exports = { loginInstagram, postPhoto, postVideo };
+// Navbatda hozircha nechta post kutayotganini bilish uchun (UX xabari uchun)
+function queueSize() {
+  return queue.size();
+}
+
+module.exports = { loginInstagram, postPhoto, postVideo, queueSize };
