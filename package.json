@@ -1,0 +1,15 @@
+{
+  "name": "instagram-telegram-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "instagram-private-api": "^1.45.3",
+    "mongoose": "^8.3.0",
+    "axios": "^1.6.8",
+    "sharp": "^0.33.3"
+  }
+}
