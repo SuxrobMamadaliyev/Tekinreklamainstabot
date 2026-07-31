@@ -17,6 +17,9 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 const HARD_MIN_INTERVAL_HOURS = 3;
 const INTERVAL_OPTIONS = [3, 6, 12, 24];
 
+// Admin uchun alohida, ancha qisqa interval (daqiqa)
+const ADMIN_INTERVAL_MINUTES = 5;
+
 // ─── HELPERS ────────────────────────────────────────────────────────────────
 
 function isAdmin(userId) {
@@ -66,6 +69,16 @@ function formatRemaining(ms) {
   if (h > 0 && m > 0) return `${h} soat ${m} daqiqa`;
   if (h > 0) return `${h} soat`;
   return `${m} daqiqa`;
+}
+
+// Admin hozir post qila oladimi, tekshiradi (5 daqiqalik alohida interval)
+async function canAdminPostNow() {
+  const lastPostAt = await Setting.get('admin_last_post_at', null);
+  if (!lastPostAt) return { allowed: true };
+  const intervalMs = ADMIN_INTERVAL_MINUTES * 60000;
+  const elapsed = Date.now() - new Date(lastPostAt).getTime();
+  if (elapsed >= intervalMs) return { allowed: true };
+  return { allowed: false, remainingMs: intervalMs - elapsed };
 }
 
 async function sendIntervalWaitMessage(ctx, remainingMs) {
@@ -260,8 +273,71 @@ bot.on('text', async (ctx) => {
 // ─── RASM HANDLER ────────────────────────────────────────────────────────────
 
 bot.on('photo', async (ctx) => {
+  // ─── ADMIN: majburiy obuna va oddiy interval'ga qaramay, faqat 5 daqiqalik interval bilan post qiladi
   if (isAdmin(ctx.from.id)) {
-    return ctx.reply('👑 Admin sifatida post yuborish uchun oddiy user sifatida kiriting.');
+    const check = await canAdminPostNow();
+    if (!check.allowed) {
+      return ctx.reply(
+        `⏳ *Admin interval hali tugamadi!*\n\n` +
+        `🕒 Keyingi post uchun: *${formatRemaining(check.remainingMs)}* qoldi`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    const waitingInQueue = queueSize();
+    const msg = await ctx.reply(
+      waitingInQueue > 0
+        ? `⏳ Navbatda kutilmoqda... (${waitingInQueue}-oʻrin)`
+        : '⏳ Rasm yuklanmoqda...'
+    );
+
+    try {
+      const photo   = ctx.message.photo.at(-1);
+      const caption = ctx.message.caption || '';
+
+      const rawBuf = await downloadFile(photo.file_id);
+      const imgBuf = await prepareImage(rawBuf);
+
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, null,
+        '📤 Instagram ga yuklanmoqda...'
+      );
+
+      const result = await postPhoto(imgBuf, caption);
+
+      await Post.create({
+        telegramUserId:   ctx.from.id,
+        telegramUsername: ctx.from.username || '',
+        caption,
+        type:             'photo',
+        instagramMediaId: result.media?.id || '',
+        status:           'success'
+      });
+      await Setting.set('admin_last_post_at', new Date());
+
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, null,
+        `✅ *Post muvaffaqiyatli yuklandi!*\n\n` +
+        `⏱ Keyingi post: *${ADMIN_INTERVAL_MINUTES} daqiqa* dan so'ng\n` +
+        `📱 @${process.env.IG_USERNAME}`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      console.error('❌ Admin rasm xatosi:', err.message);
+      await Post.create({
+        telegramUserId:   ctx.from.id,
+        telegramUsername: ctx.from.username || '',
+        type:             'photo',
+        status:           'failed',
+        error:            err.message
+      });
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, null,
+        `❌ *Xatolik yuz berdi!*\n\n\`${err.message}\`\n\nQayta urinib ko'ring.`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+    return;
   }
 
   const user = await ensureUser(ctx.from);
@@ -334,7 +410,84 @@ bot.on('photo', async (ctx) => {
 // ─── VIDEO HANDLER ───────────────────────────────────────────────────────────
 
 bot.on('video', async (ctx) => {
-  if (isAdmin(ctx.from.id)) return;
+  // ─── ADMIN: majburiy obuna va oddiy interval'ga qaramay, faqat 5 daqiqalik interval bilan post qiladi
+  if (isAdmin(ctx.from.id)) {
+    const check = await canAdminPostNow();
+    if (!check.allowed) {
+      return ctx.reply(
+        `⏳ *Admin interval hali tugamadi!*\n\n` +
+        `🕒 Keyingi post uchun: *${formatRemaining(check.remainingMs)}* qoldi`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    const video = ctx.message.video;
+    if (video.file_size > 100 * 1024 * 1024) {
+      return ctx.reply('❌ Video hajmi 100 MB dan oshmasligi kerak!');
+    }
+
+    const waitingInQueue = queueSize();
+    const msg = await ctx.reply(
+      waitingInQueue > 0
+        ? `⏳ Navbatda kutilmoqda... (${waitingInQueue}-oʻrin)`
+        : '⏳ Video yuklanmoqda... (biroz vaqt olishi mumkin)'
+    );
+
+    try {
+      const caption   = ctx.message.caption || '';
+      const videoBuf  = await downloadFile(video.file_id);
+
+      let coverBuf;
+      if (video.thumb) {
+        const raw = await downloadFile(video.thumb.file_id);
+        coverBuf  = await prepareImage(raw);
+      } else {
+        coverBuf = await sharp({
+          create: { width: 640, height: 640, channels: 3, background: { r: 0, g: 0, b: 0 } }
+        }).jpeg().toBuffer();
+      }
+
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, null,
+        '📤 Instagram ga yuklanmoqda...'
+      );
+
+      const result = await postVideo(videoBuf, coverBuf, caption);
+
+      await Post.create({
+        telegramUserId:   ctx.from.id,
+        telegramUsername: ctx.from.username || '',
+        caption,
+        type:             'video',
+        instagramMediaId: result.media?.id || '',
+        status:           'success'
+      });
+      await Setting.set('admin_last_post_at', new Date());
+
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, null,
+        `✅ *Video muvaffaqiyatli yuklandi!*\n\n` +
+        `⏱ Keyingi post: *${ADMIN_INTERVAL_MINUTES} daqiqa* dan so'ng\n` +
+        `📱 @${process.env.IG_USERNAME}`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      console.error('❌ Admin video xatosi:', err.message);
+      await Post.create({
+        telegramUserId:   ctx.from.id,
+        telegramUsername: ctx.from.username || '',
+        type:             'video',
+        status:           'failed',
+        error:            err.message
+      });
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, null,
+        `❌ *Xatolik:* \`${err.message}\``,
+        { parse_mode: 'Markdown' }
+      );
+    }
+    return;
+  }
 
   const user = await ensureUser(ctx.from);
   if (user.isBlocked) return ctx.reply('🚫 Siz bloklandingiz.');
