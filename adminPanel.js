@@ -2,7 +2,10 @@ const { Markup } = require('telegraf');
 const User = require('./userModel');
 const Post = require('./postModel');
 const Setting = require('./settingModel');
+const Channel = require('./channelModel');
 const { loginInstagram } = require('./instagram');
+
+const HARD_MIN_INTERVAL_HOURS = 3;
 
 // Admin multi-step holat
 const adminState = new Map();
@@ -12,37 +15,38 @@ function adminKeyboard() {
   return Markup.keyboard([
     ['📊 Statistika',        '👥 Foydalanuvchilar'],
     ['📋 Postlar logi',      '🔍 User topish'],
-    ['⚙️ Global limit',      '📢 Broadcast'],
-    ['🔄 IG Session',        '📵 Bloklangan userlar'],
-    ['🏠 Asosiy menu']
+    ['⏱ Interval sozlamalari', '📢 Majburiy kanal'],
+    ['📣 Broadcast',         '🔄 IG Session'],
+    ['📵 Bloklangan userlar', '🏠 Asosiy menu']
   ]).resize();
 }
 
 // ─── FOYDALANUVCHI BATAFSIL ─────────────────────────────────────────────────
 async function showUserDetail(ctx, user) {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-
-  const todayPosts = await Post.countDocuments({
-    telegramUserId: user.telegramId,
-    status: 'success',
-    createdAt: { $gte: today }
-  });
-
   const name = user.username ? `@${user.username}` : (user.firstName || 'Nomsiz');
   const statusIcon = user.isBlocked ? '🚫' : '✅';
   const joinDate = new Date(user.createdAt).toLocaleDateString('uz-UZ');
-  const remaining = Math.max(0, user.dailyLimit - todayPosts);
+
+  let nextPostText = '✅ Hozir post qila oladi';
+  if (user.lastPostAt) {
+    const intervalMs = user.intervalHours * 3600000;
+    const elapsed = Date.now() - new Date(user.lastPostAt).getTime();
+    if (elapsed < intervalMs) {
+      const remainingMin = Math.ceil((intervalMs - elapsed) / 60000);
+      const h = Math.floor(remainingMin / 60);
+      const m = remainingMin % 60;
+      nextPostText = `⏳ ${h > 0 ? h + ' soat ' : ''}${m} daqiqadan so'ng`;
+    }
+  }
 
   const text =
     `👤 *Foydalanuvchi:* ${name}\n` +
     `🆔 ID: \`${user.telegramId}\`\n` +
     `📌 Holat: ${statusIcon} ${user.isBlocked ? 'Bloklangan' : 'Faol'}\n` +
     `📅 Qo'shilgan: ${joinDate}\n\n` +
-    `📸 Bugun: ${todayPosts}/${user.dailyLimit} post\n` +
-    `⏳ Qoldi: ${remaining} ta\n` +
-    `📦 Jami: ${user.totalPosts} ta post\n` +
-    `⚙️ Kunlik limit: *${user.dailyLimit}* ta`;
+    `⏱ Interval: *${user.intervalHours} soat*\n` +
+    `🕒 Keyingi post: ${nextPostText}\n` +
+    `📦 Jami: ${user.totalPosts} ta post`;
 
   const blockBtn = user.isBlocked
     ? { text: '✅ Blokdan chiqarish', callback_data: `unblock_${user.telegramId}` }
@@ -50,12 +54,32 @@ async function showUserDetail(ctx, user) {
 
   const keyboard = Markup.inlineKeyboard([
     [blockBtn],
-    [{ text: '✏️ Limitni o\'zgartirish', callback_data: `setlimit_${user.telegramId}` }],
+    [{ text: '✏️ Intervalni oʻzgartirish', callback_data: `setuserinterval_${user.telegramId}` }],
     [{ text: '📋 Postlarini ko\'rish',   callback_data: `userposts_${user.telegramId}` }],
     [{ text: '🗑 Postlarini tozalash',   callback_data: `clearposts_${user.telegramId}` }]
   ]);
 
   return ctx.reply(text, { parse_mode: 'Markdown', ...keyboard });
+}
+
+// ─── MAJBURIY KANALLAR ROʻYXATI ─────────────────────────────────────────────
+async function showChannelsList(ctx) {
+  const channels = await Channel.find();
+
+  let msg = `📢 *Majburiy obuna kanallari*\n\n`;
+  msg += channels.length
+    ? `Hozirgi kanallar (${channels.length} ta):`
+    : `Hozircha majburiy kanal qo'shilmagan.`;
+
+  const rows = channels.map(ch => [
+    {
+      text: `🗑 ${ch.title || ch.username || ch.chatId}`,
+      callback_data: `removechannel_${ch.chatId}`
+    }
+  ]);
+  rows.push([{ text: '➕ Kanal qoʻshish', callback_data: 'addchannel' }]);
+
+  return ctx.reply(msg, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) });
 }
 
 // ─── ASOSIY ADMIN HANDLER ───────────────────────────────────────────────────
@@ -94,16 +118,17 @@ async function handleAdmin(ctx, bot) {
       );
     }
 
-    // Global limit o'zgartirish
-    if (state.action === 'set_global_limit') {
-      const limit = parseInt(text);
-      if (isNaN(limit) || limit < 1) return ctx.reply('❌ 1 dan katta butun son kiriting:');
+    // Global minimal interval o'zgartirish
+    if (state.action === 'set_min_interval') {
+      const hours = parseInt(text);
+      if (isNaN(hours) || hours < HARD_MIN_INTERVAL_HOURS) {
+        return ctx.reply(`❌ Kamida ${HARD_MIN_INTERVAL_HOURS} soat bo'lgan butun son kiriting:`);
+      }
       adminState.delete(adminId);
-      await Setting.set('daily_limit', limit);
-      // Barcha userlarga yangilash
-      await User.updateMany({}, { dailyLimit: limit });
+      await Setting.set('min_interval_hours', hours);
       return ctx.reply(
-        `✅ Global limit *${limit}* ga o'zgartirildi!\n_(Barcha foydalanuvchilarga qo'llanildi)_`,
+        `✅ Minimal interval *${hours} soat* ga o'zgartirildi!\n` +
+        `_(Yangi foydalanuvchilar shu interval bilan boshlanadi)_`,
         { parse_mode: 'Markdown', ...adminKeyboard() }
       );
     }
@@ -122,16 +147,51 @@ async function handleAdmin(ctx, bot) {
       return showUserDetail(ctx, user);
     }
 
-    // User uchun maxsus limit
-    if (state.action === 'set_user_limit') {
-      const limit = parseInt(text);
-      if (isNaN(limit) || limit < 1) return ctx.reply('❌ 1 dan katta butun son kiriting:');
+    // User uchun maxsus interval
+    if (state.action === 'set_user_interval') {
+      const hours = parseInt(text);
+      if (isNaN(hours) || hours < 1) return ctx.reply('❌ 1 dan katta butun son kiriting:');
       const targetId = state.targetId;
       adminState.delete(adminId);
-      await User.findOneAndUpdate({ telegramId: targetId }, { dailyLimit: limit });
+      await User.findOneAndUpdate({ telegramId: targetId }, { intervalHours: hours });
       const user = await User.findOne({ telegramId: targetId });
-      await ctx.reply(`✅ Limit *${limit}* ga o'zgartirildi!`, { parse_mode: 'Markdown' });
+      await ctx.reply(`✅ Interval *${hours} soat* ga o'zgartirildi!`, { parse_mode: 'Markdown' });
       return showUserDetail(ctx, user);
+    }
+
+    // Majburiy kanal qo'shish (@username orqali)
+    if (state.action === 'add_channel') {
+      const username = text.trim().replace('@', '');
+      try {
+        const chat = await ctx.telegram.getChat(`@${username}`);
+        if (!['channel', 'supergroup'].includes(chat.type)) {
+          return ctx.reply('❌ Bu kanal emas. Kanal @username kiriting:');
+        }
+
+        // Bot shu kanalda admin ekanligini tekshirish
+        const me = await ctx.telegram.getMe();
+        const botMember = await ctx.telegram.getChatMember(chat.id, me.id);
+        if (!['administrator', 'creator'].includes(botMember.status)) {
+          return ctx.reply(
+            `❌ Bot "${chat.title}" kanalida admin emas!\n` +
+            `Avval botni kanalga admin qilib qo'shing, keyin @username qayta yuboring:`
+          );
+        }
+
+        adminState.delete(adminId);
+        await Channel.findOneAndUpdate(
+          { chatId: chat.id },
+          { chatId: chat.id, username: chat.username || '', title: chat.title || '' },
+          { upsert: true }
+        );
+        await ctx.reply(`✅ "${chat.title}" majburiy obuna ro'yxatiga qo'shildi!`, adminKeyboard());
+        return showChannelsList(ctx);
+      } catch (e) {
+        return ctx.reply(
+          `❌ Kanal topilmadi yoki xatolik: ${e.message}\n\n` +
+          `Kanal @username kiriting (masalan: @mychannel):`
+        );
+      }
     }
   }
 
@@ -147,7 +207,7 @@ async function handleAdmin(ctx, bot) {
     const today = new Date(); today.setHours(0, 0, 0, 0);
     const todayPosts = await Post.countDocuments({ status: 'success', createdAt: { $gte: today } });
 
-    const globalLimit = await Setting.get('daily_limit', 1);
+    const minInterval = await Setting.get('min_interval_hours', HARD_MIN_INTERVAL_HOURS);
 
     // Haftalik postlar
     const week = new Date(); week.setDate(week.getDate() - 7);
@@ -165,7 +225,7 @@ async function handleAdmin(ctx, bot) {
       `   Hafta: *${weekPosts}*\n` +
       `   Jami: *${totalPosts}*\n` +
       `   Xatolik: *${failedPosts}*\n\n` +
-      `⚙️ Global kunlik limit: *${globalLimit} ta*\n` +
+      `⏱ Minimal interval: *${minInterval} soat*\n` +
       `📱 Instagram: *@${process.env.IG_USERNAME}*`,
       { parse_mode: 'Markdown' }
     );
@@ -183,7 +243,7 @@ async function handleAdmin(ctx, bot) {
       const icon = u.isBlocked ? '🚫' : '✅';
       const name = u.username ? `@${u.username}` : (u.firstName || 'Nomsiz');
       msg += `${i + 1}. ${icon} ${name}\n`;
-      msg += `   📸 ${u.totalPosts} post | ⚙️ ${u.dailyLimit}/kun\n`;
+      msg += `   📸 ${u.totalPosts} post | ⏱ ${u.intervalHours} soat\n`;
       msg += `   \`${u.telegramId}\`\n\n`;
     }
     msg += `_Batafsil: 🔍 User topish_`;
@@ -210,16 +270,23 @@ async function handleAdmin(ctx, bot) {
     return ctx.reply(msg, { parse_mode: 'Markdown' });
   }
 
-  // ⚙️ Global limit
-  if (text === '⚙️ Global limit') {
-    const current = await Setting.get('daily_limit', 1);
-    adminState.set(adminId, { action: 'set_global_limit' });
+  // ⏱ Interval sozlamalari
+  if (text === '⏱ Interval sozlamalari') {
+    const current = await Setting.get('min_interval_hours', HARD_MIN_INTERVAL_HOURS);
+    adminState.set(adminId, { action: 'set_min_interval' });
     return ctx.reply(
-      `⚙️ *Global Kunlik Limit*\n\n` +
-      `Hozirgi: *${current} ta/kun*\n\n` +
-      `Yangi limitni kiriting:\n_(Bu barcha foydalanuvchilarga qo'llaniladi)_`,
+      `⏱ *Minimal Post Interval*\n\n` +
+      `Hozirgi: *${current} soat*\n` +
+      `(Tizim bo'yicha eng kichik ruxsat etilgan qiymat: ${HARD_MIN_INTERVAL_HOURS} soat)\n\n` +
+      `Yangi minimal intervalni soatda kiriting:\n` +
+      `_(Bu yangi foydalanuvchilar uchun standart bo'ladi)_`,
       { parse_mode: 'Markdown', ...Markup.keyboard([['❌ Bekor qilish']]).resize() }
     );
+  }
+
+  // 📢 Majburiy kanal
+  if (text === '📢 Majburiy kanal') {
+    return showChannelsList(ctx);
   }
 
   // 🔍 User topish
@@ -231,8 +298,8 @@ async function handleAdmin(ctx, bot) {
     );
   }
 
-  // 📢 Broadcast
-  if (text === '📢 Broadcast') {
+  // 📣 Broadcast
+  if (text === '📣 Broadcast') {
     const count = await User.countDocuments({ isBlocked: false });
     adminState.set(adminId, { action: 'broadcast' });
     return ctx.reply(
@@ -313,15 +380,15 @@ async function handleAdminCallback(ctx) {
     return showUserDetail(ctx, user);
   }
 
-  // ✏️ Limit o'zgartirish
-  if (data.startsWith('setlimit_')) {
+  // ✏️ Interval o'zgartirish (foydalanuvchi uchun)
+  if (data.startsWith('setuserinterval_')) {
     const targetId = parseInt(data.split('_')[1]);
-    adminState.set(adminId, { action: 'set_user_limit', targetId });
+    adminState.set(adminId, { action: 'set_user_interval', targetId });
     await ctx.answerCbQuery();
     const user = await User.findOne({ telegramId: targetId });
     const name = user.username ? `@${user.username}` : `ID: ${targetId}`;
     return ctx.reply(
-      `✏️ *${name}* uchun yangi kunlik limit kiriting:`,
+      `✏️ *${name}* uchun yangi intervalni soatda kiriting:`,
       { parse_mode: 'Markdown' }
     );
   }
@@ -373,6 +440,26 @@ async function handleAdminCallback(ctx) {
   if (data.startsWith('cancelclear_')) {
     await ctx.answerCbQuery('↩️ Bekor qilindi');
     return;
+  }
+
+  // ➕ Majburiy kanal qo'shish
+  if (data === 'addchannel') {
+    adminState.set(adminId, { action: 'add_channel' });
+    await ctx.answerCbQuery();
+    return ctx.reply(
+      `➕ *Majburiy kanal qo'shish*\n\n` +
+      `⚠️ Botni avval kanalga *admin* qilib qo'shing.\n\n` +
+      `Kanal @username kiriting (masalan: @mychannel):`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  // 🗑 Majburiy kanalni o'chirish
+  if (data.startsWith('removechannel_')) {
+    const chatId = parseInt(data.split('_')[1]);
+    await Channel.deleteOne({ chatId });
+    await ctx.answerCbQuery('🗑 Kanal o\'chirildi');
+    return showChannelsList(ctx);
   }
 
   ctx.answerCbQuery();
