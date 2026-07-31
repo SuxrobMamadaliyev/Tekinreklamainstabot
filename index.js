@@ -4,13 +4,18 @@ const mongoose = require('mongoose');
 const axios = require('axios');
 const sharp = require('sharp');
 
-const { loginInstagram, postPhoto, postVideo } = require('./instagram');
+const { loginInstagram, postPhoto, postVideo, queueSize } = require('./instagram');
 const User = require('./userModel');
 const Post = require('./postModel');
 const Setting = require('./settingModel');
+const { getUnsubscribedChannels, subscriptionKeyboard } = require('./subscription');
 const { adminKeyboard, handleAdmin, handleAdminCallback } = require('./adminPanel');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
+
+// Har qanday holatda ham intervalni bundan pastga tushirib bo'lmaydi (soat)
+const HARD_MIN_INTERVAL_HOURS = 3;
+const INTERVAL_OPTIONS = [3, 6, 12, 24];
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────
 
@@ -21,36 +26,67 @@ function isAdmin(userId) {
 function userKeyboard() {
   return Markup.keyboard([
     ['📸 Rasm yuborish', '🎬 Video yuborish'],
-    ['📊 Statistikam',   'ℹ️ Yordam']
+    ['⏱ Interval sozlash', '📊 Statistikam'],
+    ['☎️ Admin bilan bogʻlanish', '📖 Qanday foydalanish']
   ]).resize();
 }
 
 async function ensureUser(from) {
+  const defaultInterval = await Setting.get('min_interval_hours', HARD_MIN_INTERVAL_HOURS);
   return User.findOneAndUpdate(
     { telegramId: from.id },
     {
       $setOnInsert: {
-        telegramId: from.id,
-        username:   from.username || '',
-        firstName:  from.first_name || '',
-        isBlocked:  false,
-        dailyLimit: 1,
-        totalPosts: 0
+        telegramId:    from.id,
+        username:      from.username || '',
+        firstName:     from.first_name || '',
+        isBlocked:     false,
+        intervalHours: Math.max(defaultInterval, HARD_MIN_INTERVAL_HOURS),
+        lastPostAt:    null,
+        totalPosts:    0
       }
     },
     { upsert: true, new: true }
   );
 }
 
-// Bugungi post sonini qaytaradi
-async function todayPostCount(telegramId) {
-  const from = new Date();
-  from.setHours(0, 0, 0, 0);
-  return Post.countDocuments({
-    telegramUserId: telegramId,
-    status: 'success',
-    createdAt: { $gte: from }
-  });
+// Foydalanuvchi hozir post qila oladimi, tekshiradi
+function canPostNow(user) {
+  if (!user.lastPostAt) return { allowed: true };
+  const intervalMs = user.intervalHours * 3600000;
+  const elapsed = Date.now() - new Date(user.lastPostAt).getTime();
+  if (elapsed >= intervalMs) return { allowed: true };
+  return { allowed: false, remainingMs: intervalMs - elapsed };
+}
+
+function formatRemaining(ms) {
+  const totalMin = Math.ceil(ms / 60000);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h > 0 && m > 0) return `${h} soat ${m} daqiqa`;
+  if (h > 0) return `${h} soat`;
+  return `${m} daqiqa`;
+}
+
+async function sendIntervalWaitMessage(ctx, remainingMs) {
+  return ctx.reply(
+    `⏳ *Hali vaqt boʻlmadi!*\n\n` +
+    `🕒 Keyingi post uchun: *${formatRemaining(remainingMs)}* qoldi\n\n` +
+    `_Intervalni oʻzgartirish uchun "⏱ Interval sozlash" tugmasidan foydalaning._`,
+    { parse_mode: 'Markdown' }
+  );
+}
+
+// Majburiy obuna tekshiruvi. true = davom etsa boʻladi, false = obuna soʻraldi
+async function requireSubscription(ctx) {
+  const unsub = await getUnsubscribedChannels(ctx.telegram, ctx.from.id);
+  if (!unsub.length) return true;
+
+  await ctx.reply(
+    `🔒 *Botdan foydalanish uchun quyidagi kanal(lar)ga obuna boʻling:*`,
+    { parse_mode: 'Markdown', ...subscriptionKeyboard(unsub) }
+  );
+  return false;
 }
 
 // Faylni buffer sifatida yuklab olish
@@ -68,30 +104,13 @@ async function prepareImage(buf) {
     .toBuffer();
 }
 
-// Limit xabarini yuborish
-async function sendLimitMessage(ctx, todayCount, limit) {
-  const reset = new Date();
-  reset.setDate(reset.getDate() + 1);
-  reset.setHours(0, 0, 0, 0);
-  const hours = Math.ceil((reset - Date.now()) / 3600000);
-
-  return ctx.reply(
-    `⏳ *Kunlik limitingiz tugadi!*\n\n` +
-    `📸 Bugun: ${todayCount}/${limit} post\n` +
-    `🕛 Yangilanadi: *${hours} soatdan so'ng*\n\n` +
-    `_Limitni oshirish uchun adminga murojaat qiling._`,
-    { parse_mode: 'Markdown' }
-  );
-}
-
 // ─── MONGODB ─────────────────────────────────────────────────────────────────
 
 mongoose.connect(process.env.MONGO_URI)
   .then(async () => {
     console.log('✅ MongoDB ulandi');
-    // Global limit mavjud emasligini tekshirish
-    const exists = await Setting.findOne({ key: 'daily_limit' });
-    if (!exists) await Setting.set('daily_limit', 1);
+    const exists = await Setting.findOne({ key: 'min_interval_hours' });
+    if (!exists) await Setting.set('min_interval_hours', HARD_MIN_INTERVAL_HOURS);
     await loginInstagram();
   })
   .catch(err => {
@@ -116,14 +135,17 @@ bot.start(async (ctx) => {
     return ctx.reply('🚫 Siz bloklandingiz. Admin bilan bog\'laning.');
   }
 
-  const todayCount = await todayPostCount(user.telegramId);
-  const remaining  = Math.max(0, user.dailyLimit - todayCount);
+  if (!(await requireSubscription(ctx))) return;
+
+  const check = canPostNow(user);
 
   return ctx.reply(
     `👋 Salom, *${ctx.from.first_name}*!\n\n` +
-    `📸 Rasmingizni yuboring — men Instagram'ga post qilaman!\n\n` +
-    `⚙️ Kunlik limit: *${user.dailyLimit} ta*\n` +
-    `⏳ Bugun qoldi: *${remaining} ta*`,
+    `📸 Rasm yoki video yuboring — men Instagram'ga post qilaman!\n\n` +
+    `⏱ Sizning intervalingiz: *${user.intervalHours} soat*\n` +
+    (check.allowed
+      ? `✅ Hozir post qilishingiz mumkin`
+      : `⏳ Keyingi post: *${formatRemaining(check.remainingMs)}* dan so'ng`),
     { parse_mode: 'Markdown', ...userKeyboard() }
   );
 });
@@ -141,55 +163,91 @@ bot.on('text', async (ctx) => {
 
   // 📸 Rasm yuborish
   if (text === '📸 Rasm yuborish') {
-    const todayCount = await todayPostCount(user.telegramId);
-    if (todayCount >= user.dailyLimit) return sendLimitMessage(ctx, todayCount, user.dailyLimit);
+    if (!(await requireSubscription(ctx))) return;
+    const check = canPostNow(user);
+    if (!check.allowed) return sendIntervalWaitMessage(ctx, check.remainingMs);
     return ctx.reply(
       `📸 *Rasmni yuboring*\n\n` +
-      `Caption (izoh) qo'shmoqchi bo'lsangiz, rasm bilan birga yozing.\n\n` +
-      `⏳ Bugun qolgan: *${user.dailyLimit - todayCount} ta*`,
+      `Caption (izoh) qo'shmoqchi bo'lsangiz, rasm bilan birga yozing.`,
       { parse_mode: 'Markdown' }
     );
   }
 
   // 🎬 Video yuborish
   if (text === '🎬 Video yuborish') {
-    const todayCount = await todayPostCount(user.telegramId);
-    if (todayCount >= user.dailyLimit) return sendLimitMessage(ctx, todayCount, user.dailyLimit);
+    if (!(await requireSubscription(ctx))) return;
+    const check = canPostNow(user);
+    if (!check.allowed) return sendIntervalWaitMessage(ctx, check.remainingMs);
     return ctx.reply(
       `🎬 *Videoni yuboring*\n\n` +
       `Max hajm: *100 MB*\n` +
-      `Caption qo'shmoqchi bo'lsangiz, video bilan birga yozing.\n\n` +
-      `⏳ Bugun qolgan: *${user.dailyLimit - todayCount} ta*`,
+      `Caption qo'shmoqchi bo'lsangiz, video bilan birga yozing.`,
       { parse_mode: 'Markdown' }
+    );
+  }
+
+  // ⏱ Interval sozlash
+  if (text === '⏱ Interval sozlash') {
+    const minAllowed = Math.max(
+      await Setting.get('min_interval_hours', HARD_MIN_INTERVAL_HOURS),
+      HARD_MIN_INTERVAL_HOURS
+    );
+    const options = INTERVAL_OPTIONS.filter(h => h >= minAllowed);
+    const buttons = options.map(h => [
+      Markup.button.callback(
+        `${h} soat${h === user.intervalHours ? ' ✅' : ''}`,
+        `setinterval_${h}`
+      )
+    ]);
+    return ctx.reply(
+      `⏱ *Post intervalini tanlang*\n\n` +
+      `Hozirgi interval: *${user.intervalHours} soat*\n` +
+      `Minimal interval: *${minAllowed} soat*`,
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
     );
   }
 
   // 📊 Statistikam
   if (text === '📊 Statistikam') {
-    const todayCount = await todayPostCount(user.telegramId);
-    const remaining  = Math.max(0, user.dailyLimit - todayCount);
-    const joinDate   = new Date(user.createdAt).toLocaleDateString('uz-UZ');
+    const joinDate = new Date(user.createdAt).toLocaleDateString('uz-UZ');
+    const check = canPostNow(user);
 
     return ctx.reply(
       `📊 *Sizning statistikangiz:*\n\n` +
-      `📸 Bugun: *${todayCount}/${user.dailyLimit}* post\n` +
-      `⏳ Qoldi: *${remaining} ta*\n` +
+      `⏱ Interval: *${user.intervalHours} soat*\n` +
+      (check.allowed
+        ? `✅ Holat: *Post qilishingiz mumkin*\n`
+        : `⏳ Keyingi post: *${formatRemaining(check.remainingMs)}* dan so'ng\n`) +
       `📦 Jami postlar: *${user.totalPosts} ta*\n` +
       `📅 Bot'ga qo'shilgan: *${joinDate}*`,
       { parse_mode: 'Markdown' }
     );
   }
 
-  // ℹ️ Yordam
-  if (text === 'ℹ️ Yordam') {
-    const globalLimit = await Setting.get('daily_limit', 1);
+  // ☎️ Admin bilan bogʻlanish
+  if (text === '☎️ Admin bilan bogʻlanish') {
     return ctx.reply(
-      `ℹ️ *Yordam*\n\n` +
-      `📸 *Rasm:* Rasmni to'g'ridan-to'g'ri yoki tugma orqali yuboring\n` +
-      `🎬 *Video:* Videoni yuboring (max 100 MB)\n` +
-      `📝 *Caption:* Media bilan birga matn yozing\n\n` +
-      `⚙️ Kunlik limit: *${user.dailyLimit} ta post*\n` +
-      `📱 Instagram: *@${process.env.IG_USERNAME}*\n\n` +
+      `☎️ *Admin bilan bogʻlanish*\n\n` +
+      `Savol yoki muammo yuzasidan quyidagi admin bilan bogʻlaning:\n` +
+      `👤 @${process.env.ADMIN_USERNAME || 'admin'}`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  // 📖 Qanday foydalanish
+  if (text === '📖 Qanday foydalanish') {
+    const minAllowed = Math.max(
+      await Setting.get('min_interval_hours', HARD_MIN_INTERVAL_HOURS),
+      HARD_MIN_INTERVAL_HOURS
+    );
+    return ctx.reply(
+      `📖 *Bot qanday ishlaydi?*\n\n` +
+      `1️⃣ "📸 Rasm yuborish" yoki "🎬 Video yuborish" tugmasini bosing\n` +
+      `2️⃣ Rasm yoki videoni (xohlasangiz caption bilan) yuboring\n` +
+      `3️⃣ Bot avtomatik ravishda Instagram'ga post qiladi\n` +
+      `4️⃣ Keyingi postgacha kamida *${minAllowed} soat* kutish kerak\n` +
+      `5️⃣ Intervalni "⏱ Interval sozlash" orqali oʻzgartirishingiz mumkin\n\n` +
+      `📱 Instagram: *@${process.env.IG_USERNAME}*\n` +
       `❓ Muammo bo'lsa: @${process.env.ADMIN_USERNAME || 'admin'}`,
       { parse_mode: 'Markdown' }
     );
@@ -208,13 +266,17 @@ bot.on('photo', async (ctx) => {
 
   const user = await ensureUser(ctx.from);
   if (user.isBlocked) return ctx.reply('🚫 Siz bloklandingiz.');
+  if (!(await requireSubscription(ctx))) return;
 
-  const todayCount = await todayPostCount(user.telegramId);
-  if (todayCount >= user.dailyLimit) {
-    return sendLimitMessage(ctx, todayCount, user.dailyLimit);
-  }
+  const check = canPostNow(user);
+  if (!check.allowed) return sendIntervalWaitMessage(ctx, check.remainingMs);
 
-  const msg = await ctx.reply('⏳ Rasm yuklanmoqda...');
+  const waitingInQueue = queueSize();
+  const msg = await ctx.reply(
+    waitingInQueue > 0
+      ? `⏳ Navbatda kutilmoqda... (${waitingInQueue}-oʻrin)`
+      : '⏳ Rasm yuklanmoqda...'
+  );
 
   try {
     const photo   = ctx.message.photo.at(-1);
@@ -241,17 +303,13 @@ bot.on('photo', async (ctx) => {
     });
     await User.findOneAndUpdate(
       { telegramId: user.telegramId },
-      { $inc: { totalPosts: 1 } }
+      { $inc: { totalPosts: 1 }, lastPostAt: new Date() }
     );
-
-    const newCount = todayCount + 1;
-    const remaining = Math.max(0, user.dailyLimit - newCount);
 
     await ctx.telegram.editMessageText(
       ctx.chat.id, msg.message_id, null,
       `✅ *Post muvaffaqiyatli yuklandi!*\n\n` +
-      `📸 Bugun: ${newCount}/${user.dailyLimit}\n` +
-      `⏳ Qoldi: ${remaining} ta\n` +
+      `⏱ Keyingi post: *${user.intervalHours} soat* dan so'ng\n` +
       `📱 @${process.env.IG_USERNAME}`,
       { parse_mode: 'Markdown' }
     );
@@ -280,18 +338,22 @@ bot.on('video', async (ctx) => {
 
   const user = await ensureUser(ctx.from);
   if (user.isBlocked) return ctx.reply('🚫 Siz bloklandingiz.');
+  if (!(await requireSubscription(ctx))) return;
 
-  const todayCount = await todayPostCount(user.telegramId);
-  if (todayCount >= user.dailyLimit) {
-    return sendLimitMessage(ctx, todayCount, user.dailyLimit);
-  }
+  const check = canPostNow(user);
+  if (!check.allowed) return sendIntervalWaitMessage(ctx, check.remainingMs);
 
   const video = ctx.message.video;
   if (video.file_size > 100 * 1024 * 1024) {
     return ctx.reply('❌ Video hajmi 100 MB dan oshmasligi kerak!');
   }
 
-  const msg = await ctx.reply('⏳ Video yuklanmoqda... (biroz vaqt olishi mumkin)');
+  const waitingInQueue = queueSize();
+  const msg = await ctx.reply(
+    waitingInQueue > 0
+      ? `⏳ Navbatda kutilmoqda... (${waitingInQueue}-oʻrin)`
+      : '⏳ Video yuklanmoqda... (biroz vaqt olishi mumkin)'
+  );
 
   try {
     const caption   = ctx.message.caption || '';
@@ -325,17 +387,13 @@ bot.on('video', async (ctx) => {
     });
     await User.findOneAndUpdate(
       { telegramId: user.telegramId },
-      { $inc: { totalPosts: 1 } }
+      { $inc: { totalPosts: 1 }, lastPostAt: new Date() }
     );
-
-    const newCount  = todayCount + 1;
-    const remaining = Math.max(0, user.dailyLimit - newCount);
 
     await ctx.telegram.editMessageText(
       ctx.chat.id, msg.message_id, null,
       `✅ *Video muvaffaqiyatli yuklandi!*\n\n` +
-      `🎬 Bugun: ${newCount}/${user.dailyLimit}\n` +
-      `⏳ Qoldi: ${remaining} ta\n` +
+      `⏱ Keyingi post: *${user.intervalHours} soat* dan so'ng\n` +
       `📱 @${process.env.IG_USERNAME}`,
       { parse_mode: 'Markdown' }
     );
@@ -360,7 +418,49 @@ bot.on('video', async (ctx) => {
 // ─── CALLBACK QUERIES ────────────────────────────────────────────────────────
 
 bot.on('callback_query', async (ctx) => {
+  const data = ctx.callbackQuery.data;
+
   if (isAdmin(ctx.from.id)) return handleAdminCallback(ctx);
+
+  // ✅ Obunani tekshirish
+  if (data === 'check_subscription') {
+    const unsub = await getUnsubscribedChannels(ctx.telegram, ctx.from.id);
+    if (unsub.length) {
+      return ctx.answerCbQuery('❌ Hali barcha kanallarga obuna bo\'lmagansiz!', { show_alert: true });
+    }
+    await ctx.answerCbQuery('✅ Obuna tasdiqlandi!');
+    await ctx.deleteMessage().catch(() => {});
+    const user = await ensureUser(ctx.from);
+    const check = canPostNow(user);
+    return ctx.reply(
+      `✅ *Obuna tasdiqlandi!*\n\n` +
+      (check.allowed
+        ? `Endi post yuborishingiz mumkin.`
+        : `⏳ Keyingi post: *${formatRemaining(check.remainingMs)}* dan so'ng`),
+      { parse_mode: 'Markdown', ...userKeyboard() }
+    );
+  }
+
+  // ⏱ Intervalni o'rnatish
+  if (data.startsWith('setinterval_')) {
+    const hours = parseInt(data.split('_')[1]);
+    const minAllowed = Math.max(
+      await Setting.get('min_interval_hours', HARD_MIN_INTERVAL_HOURS),
+      HARD_MIN_INTERVAL_HOURS
+    );
+    if (isNaN(hours) || hours < minAllowed) {
+      return ctx.answerCbQuery('❌ Ruxsat etilmagan interval', { show_alert: true });
+    }
+    await User.findOneAndUpdate({ telegramId: ctx.from.id }, { intervalHours: hours });
+    await ctx.answerCbQuery(`✅ Interval ${hours} soatga o'zgartirildi`);
+    return ctx.editMessageText(
+      `⏱ *Interval yangilandi:* ${hours} soat`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+  }
+
+  if (data === 'noop') return ctx.answerCbQuery();
+
   ctx.answerCbQuery('❌ Ruxsat yo\'q');
 });
 
