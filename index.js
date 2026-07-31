@@ -124,11 +124,18 @@ mongoose.connect(process.env.MONGO_URI)
     console.log('✅ MongoDB ulandi');
     const exists = await Setting.findOne({ key: 'min_interval_hours' });
     if (!exists) await Setting.set('min_interval_hours', HARD_MIN_INTERVAL_HOURS);
-    await loginInstagram();
   })
   .catch(err => {
     console.error('❌ MongoDB xatosi:', err.message);
     process.exit(1);
+  });
+
+// Instagram login xatosi alohida ushlanadi — muvaffaqiyatsiz bo'lsa ham
+// bot Telegram orqali ishlayveradi (admin "🔄 IG Session" orqali qayta urinishi mumkin)
+loginInstagram()
+  .then(() => console.log('✅ Instagram ga ulandi'))
+  .catch(err => {
+    console.error('⚠️ Instagram ga ulanishda xatolik:', err.message);
   });
 
 // ─── /START ──────────────────────────────────────────────────────────────────
