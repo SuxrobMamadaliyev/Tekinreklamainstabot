@@ -4,7 +4,7 @@ const mongoose = require('mongoose');
 const axios = require('axios');
 const sharp = require('sharp');
 
-const { loginInstagram, postPhoto, postVideo, queueSize } = require('./instagram');
+const { loginInstagram, postPhoto, postVideo, queueSize, getConnectedUsername } = require('./instagram');
 const User = require('./userModel');
 const Post = require('./postModel');
 const Setting = require('./settingModel');
@@ -144,9 +144,10 @@ bot.start(async (ctx) => {
   const user = await ensureUser(ctx.from);
 
   if (isAdmin(ctx.from.id)) {
+    const igUsername = await getConnectedUsername();
     return ctx.reply(
       `👑 *Admin paneliga xush kelibsiz!*\n\n` +
-      `📱 Instagram: @${process.env.IG_USERNAME}`,
+      `📱 Instagram: ${igUsername ? '@' + igUsername : 'ulanmagan — "🔗 Instagram ulash" tugmasidan foydalaning'}`,
       { parse_mode: 'Markdown', ...adminKeyboard() }
     );
   }
@@ -260,6 +261,7 @@ bot.on('text', async (ctx) => {
       await Setting.get('min_interval_hours', HARD_MIN_INTERVAL_HOURS),
       HARD_MIN_INTERVAL_HOURS
     );
+    const igUsername = await getConnectedUsername();
     return ctx.reply(
       `📖 *Bot qanday ishlaydi?*\n\n` +
       `1️⃣ "📸 Rasm yuborish" yoki "🎬 Video yuborish" tugmasini bosing\n` +
@@ -267,7 +269,7 @@ bot.on('text', async (ctx) => {
       `3️⃣ Bot avtomatik ravishda Instagram'ga post qiladi\n` +
       `4️⃣ Keyingi postgacha kamida *${minAllowed} soat* kutish kerak\n` +
       `5️⃣ Intervalni "⏱ Interval sozlash" orqali oʻzgartirishingiz mumkin\n\n` +
-      `📱 Instagram: *@${process.env.IG_USERNAME}*\n` +
+      `📱 Instagram: *${igUsername ? '@' + igUsername : 'hozircha ulanmagan'}*\n` +
       `❓ Muammo bo'lsa: @${process.env.ADMIN_USERNAME || 'admin'}`,
       { parse_mode: 'Markdown' }
     );
@@ -322,11 +324,12 @@ bot.on('photo', async (ctx) => {
       });
       await Setting.set('admin_last_post_at', new Date());
 
+      const igUsername1 = await getConnectedUsername();
       await ctx.telegram.editMessageText(
         ctx.chat.id, msg.message_id, null,
         `✅ *Post muvaffaqiyatli yuklandi!*\n\n` +
         `⏱ Keyingi post: *${ADMIN_INTERVAL_MINUTES} daqiqa* dan so'ng\n` +
-        `📱 @${process.env.IG_USERNAME}`,
+        `📱 @${igUsername1}`,
         { parse_mode: 'Markdown' }
       );
     } catch (err) {
@@ -389,11 +392,12 @@ bot.on('photo', async (ctx) => {
       { $inc: { totalPosts: 1 }, lastPostAt: new Date() }
     );
 
+    const igUsername2 = await getConnectedUsername();
     await ctx.telegram.editMessageText(
       ctx.chat.id, msg.message_id, null,
       `✅ *Post muvaffaqiyatli yuklandi!*\n\n` +
       `⏱ Keyingi post: *${user.intervalHours} soat* dan so'ng\n` +
-      `📱 @${process.env.IG_USERNAME}`,
+      `📱 @${igUsername2}`,
       { parse_mode: 'Markdown' }
     );
 
@@ -471,11 +475,12 @@ bot.on('video', async (ctx) => {
       });
       await Setting.set('admin_last_post_at', new Date());
 
+      const igUsername3 = await getConnectedUsername();
       await ctx.telegram.editMessageText(
         ctx.chat.id, msg.message_id, null,
         `✅ *Video muvaffaqiyatli yuklandi!*\n\n` +
         `⏱ Keyingi post: *${ADMIN_INTERVAL_MINUTES} daqiqa* dan so'ng\n` +
-        `📱 @${process.env.IG_USERNAME}`,
+        `📱 @${igUsername3}`,
         { parse_mode: 'Markdown' }
       );
     } catch (err) {
@@ -550,11 +555,12 @@ bot.on('video', async (ctx) => {
       { $inc: { totalPosts: 1 }, lastPostAt: new Date() }
     );
 
+    const igUsername4 = await getConnectedUsername();
     await ctx.telegram.editMessageText(
       ctx.chat.id, msg.message_id, null,
       `✅ *Video muvaffaqiyatli yuklandi!*\n\n` +
       `⏱ Keyingi post: *${user.intervalHours} soat* dan so'ng\n` +
-      `📱 @${process.env.IG_USERNAME}`,
+      `📱 @${igUsername4}`,
       { parse_mode: 'Markdown' }
     );
 
