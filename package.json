@@ -11,6 +11,8 @@
     "instagram-private-api": "^1.45.3",
     "mongoose": "^8.3.0",
     "axios": "^1.6.8",
-    "sharp": "^0.33.3"
+    "sharp": "^0.33.3",
+    "imapflow": "^1.0.164",
+    "mailparser": "^3.7.1"
   }
 }
