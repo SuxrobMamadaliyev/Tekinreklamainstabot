@@ -1,15 +1,55 @@
 const { IgApiClient } = require('instagram-private-api');
 const Session = require('./sessionModel');
+const IgAccount = require('./igAccountModel');
 const queue = require('./queue');
+const { encrypt, decrypt } = require('./cryptoHelper');
+const { fetchInstagramCodeFromGmail } = require('./gmailChallenge');
 
 const ig = new IgApiClient();
 let isLoggedIn = false;
+
+// ─── AKKAUNT MA'LUMOTLARI (bazadan) ─────────────────────────────────────────
+
+async function getIgAccount() {
+  return IgAccount.findOne({ key: 'main' });
+}
+
+// Admin panel shu funksiyani chaqirib akkaunt/gmail ma'lumotlarini saqlaydi
+async function saveIgAccount({ igUsername, igPassword, gmailAddress, gmailAppPassword }) {
+  const update = {};
+  if (igUsername !== undefined) update.igUsername = igUsername;
+  if (igPassword !== undefined) update.igPasswordEnc = encrypt(igPassword);
+  if (gmailAddress !== undefined) update.gmailAddress = gmailAddress;
+  if (gmailAppPassword !== undefined) update.gmailAppPassEnc = encrypt(gmailAppPassword);
+
+  return IgAccount.findOneAndUpdate(
+    { key: 'main' },
+    { key: 'main', ...update },
+    { upsert: true, new: true }
+  );
+}
+
+// Hozir ulangan Instagram username'ni qaytaradi (ko'rsatish uchun)
+async function getConnectedUsername() {
+  const acc = await getIgAccount();
+  return acc?.igUsername || null;
+}
+
+// ─── LOGIN ───────────────────────────────────────────────────────────────────
 
 async function loginInstagram(forceRelogin = false) {
   if (isLoggedIn && !forceRelogin) return;
   isLoggedIn = false;
 
-  ig.state.generateDevice(process.env.IG_USERNAME);
+  const acc = await getIgAccount();
+  if (!acc || !acc.igUsername || !acc.igPasswordEnc) {
+    throw new Error('Instagram akkaunt ulanmagan. Admin panelda "🔗 Instagram ulash" tugmasi orqali ulang.');
+  }
+
+  const igUsername = acc.igUsername;
+  const igPassword = decrypt(acc.igPasswordEnc);
+
+  ig.state.generateDevice(igUsername);
 
   // Saqlangan sessionni yuklash (force bo'lmasa)
   if (!forceRelogin) {
@@ -28,7 +68,36 @@ async function loginInstagram(forceRelogin = false) {
   }
 
   // Yangi login
-  await ig.account.login(process.env.IG_USERNAME, process.env.IG_PASSWORD);
+  try {
+    await ig.account.login(igUsername, igPassword);
+  } catch (err) {
+    // Instagram xavfsizlik tekshiruvi (checkpoint) so'rasa
+    if (err.name === 'IgCheckpointError') {
+      console.log('🔒 Instagram xavfsizlik tekshiruvi (checkpoint) so\'ralmoqda...');
+
+      const gmailAddress     = acc.gmailAddress;
+      const gmailAppPassword = decrypt(acc.gmailAppPassEnc);
+
+      if (!gmailAddress || !gmailAppPassword) {
+        throw new Error(
+          'Instagram tasdiqlash kodi so\'ramoqda, lekin Gmail ulanmagan. ' +
+          'Admin panelda "🔗 Instagram ulash" orqali Gmail ma\'lumotlarini kiriting.'
+        );
+      }
+
+      // Tasdiqlash kodini email (Gmail) orqali yuborishni so'raymiz
+      await ig.challenge.auto(true);
+
+      console.log('📩 Gmail orqali tasdiqlash kodi kutilmoqda...');
+      const code = await fetchInstagramCodeFromGmail(gmailAddress, gmailAppPassword);
+
+      await ig.challenge.sendSecurityCode(code);
+      console.log('✅ Tasdiqlash kodi qabul qilindi');
+    } else {
+      throw err;
+    }
+  }
+
   const sessionData = await ig.state.serialize();
   delete sessionData.constants;
   await Session.findOneAndUpdate(
@@ -79,4 +148,11 @@ function queueSize() {
   return queue.size();
 }
 
-module.exports = { loginInstagram, postPhoto, postVideo, queueSize };
+module.exports = {
+  loginInstagram,
+  postPhoto,
+  postVideo,
+  queueSize,
+  saveIgAccount,
+  getConnectedUsername
+};
