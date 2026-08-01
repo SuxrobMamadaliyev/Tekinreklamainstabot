@@ -3,7 +3,8 @@ const User = require('./userModel');
 const Post = require('./postModel');
 const Setting = require('./settingModel');
 const Channel = require('./channelModel');
-const { loginInstagram } = require('./instagram');
+const IgAccount = require('./igAccountModel');
+const { loginInstagram, saveIgAccount, getConnectedUsername } = require('./instagram');
 
 const HARD_MIN_INTERVAL_HOURS = 3;
 
@@ -16,8 +17,9 @@ function adminKeyboard() {
     ['📊 Statistika',        '👥 Foydalanuvchilar'],
     ['📋 Postlar logi',      '🔍 User topish'],
     ['⏱ Interval sozlamalari', '📢 Majburiy kanal'],
-    ['📣 Broadcast',         '🔄 IG Session'],
-    ['📵 Bloklangan userlar', '🏠 Asosiy menu']
+    ['🔗 Instagram ulash',   '🔄 IG Session'],
+    ['📣 Broadcast',         '📵 Bloklangan userlar'],
+    ['🏠 Asosiy menu']
   ]).resize();
 }
 
@@ -80,6 +82,24 @@ async function showChannelsList(ctx) {
   rows.push([{ text: '➕ Kanal qoʻshish', callback_data: 'addchannel' }]);
 
   return ctx.reply(msg, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) });
+}
+
+// ─── INSTAGRAM ULASHNI SINAB KO'RISH ────────────────────────────────────────
+async function attemptIgConnect(ctx) {
+  const msg = await ctx.reply('🔄 Instagram ga ulanmoqda... (agar Gmail orqali tasdiqlash so\'ralsa, biroz vaqt olishi mumkin)');
+  try {
+    await loginInstagram(true);
+    await ctx.telegram.editMessageText(
+      ctx.chat.id, msg.message_id, null,
+      '✅ Instagram muvaffaqiyatli ulandi!'
+    );
+  } catch (e) {
+    await ctx.telegram.editMessageText(
+      ctx.chat.id, msg.message_id, null,
+      `❌ Ulanmadi: ${e.message}`
+    );
+  }
+  return ctx.reply('🏠 Admin panel', adminKeyboard());
 }
 
 // ─── ASOSIY ADMIN HANDLER ───────────────────────────────────────────────────
@@ -193,6 +213,54 @@ async function handleAdmin(ctx, bot) {
         );
       }
     }
+
+    // Instagram ulash — 1-qadam: username
+    if (state.action === 'ig_connect_username') {
+      const igUsername = text.trim().replace('@', '');
+      adminState.set(adminId, { action: 'ig_connect_password', igUsername });
+      return ctx.reply('🔑 Endi Instagram *parolini* kiriting:', { parse_mode: 'Markdown' });
+    }
+
+    // Instagram ulash — 2-qadam: parol
+    if (state.action === 'ig_connect_password') {
+      const igPassword = text;
+      // Xavfsizlik uchun parolni chat tarixidan darhol o'chirib tashlaymiz
+      await ctx.deleteMessage().catch(() => {});
+      adminState.set(adminId, { action: 'ig_connect_gmail_choice', igUsername: state.igUsername, igPassword });
+      return ctx.reply(
+        `🔒 Parol qabul qilindi (xabar o'chirildi).\n\n` +
+        `Instagram tasdiqlash kodi so'rasa, buni *Gmail orqali avtomatik* olishni xohlaysizmi?`,
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [{ text: '✅ Ha, Gmail orqali', callback_data: 'igconnect_gmail_yes' }],
+            [{ text: '❌ Yo\'q, o\'zim hal qilaman', callback_data: 'igconnect_gmail_no' }]
+          ])
+        }
+      );
+    }
+
+    // Instagram ulash — 3-qadam: Gmail manzili
+    if (state.action === 'ig_connect_gmail_address') {
+      adminState.set(adminId, { ...state, action: 'ig_connect_gmail_password', gmailAddress: text.trim() });
+      return ctx.reply(
+        `🔑 Gmail *App Password* kiriting (16 xonali, oddiy Gmail parolingiz EMAS!)\n\n` +
+        `Buni shu yerdan olasiz: https://myaccount.google.com/apppasswords\n` +
+        `_(Gmail'da 2 bosqichli tasdiqlash yoqilgan bo'lishi shart)_`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    // Instagram ulash — 4-qadam: Gmail App Password
+    if (state.action === 'ig_connect_gmail_password') {
+      const { igUsername, igPassword, gmailAddress } = state;
+      const gmailAppPassword = text.trim();
+      await ctx.deleteMessage().catch(() => {});
+      adminState.delete(adminId);
+      await saveIgAccount({ igUsername, igPassword, gmailAddress, gmailAppPassword });
+      await ctx.reply('✅ Gmail ma\'lumotlari saqlandi (xabar o\'chirildi).');
+      return attemptIgConnect(ctx);
+    }
   }
 
   // ── MENU TUGMALARI ──
@@ -213,6 +281,8 @@ async function handleAdmin(ctx, bot) {
     const week = new Date(); week.setDate(week.getDate() - 7);
     const weekPosts = await Post.countDocuments({ status: 'success', createdAt: { $gte: week } });
 
+    const igUsername = await getConnectedUsername();
+
     return ctx.reply(
       `📊 *BOT STATISTIKASI*\n` +
       `${'─'.repeat(28)}\n\n` +
@@ -226,7 +296,7 @@ async function handleAdmin(ctx, bot) {
       `   Jami: *${totalPosts}*\n` +
       `   Xatolik: *${failedPosts}*\n\n` +
       `⏱ Minimal interval: *${minInterval} soat*\n` +
-      `📱 Instagram: *@${process.env.IG_USERNAME}*`,
+      `📱 Instagram: *${igUsername ? '@' + igUsername : 'ulanmagan ⚠️'}*`,
       { parse_mode: 'Markdown' }
     );
   }
@@ -289,6 +359,21 @@ async function handleAdmin(ctx, bot) {
     return showChannelsList(ctx);
   }
 
+  // 🔗 Instagram ulash
+  if (text === '🔗 Instagram ulash') {
+    const acc = await IgAccount.findOne({ key: 'main' });
+    adminState.set(adminId, { action: 'ig_connect_username' });
+    return ctx.reply(
+      `🔗 *Instagram akkauntni ulash*\n\n` +
+      (acc?.igUsername
+        ? `Hozirgi ulangan: *@${acc.igUsername}*\n` +
+          (acc.gmailAddress ? `Gmail: *${acc.gmailAddress}* orqali tasdiqlanadi\n` : `Gmail ulanmagan\n`) + `\n`
+        : '') +
+      `Yangi/o'zgartirilgan Instagram username kiriting (@ belgisisiz):`,
+      { parse_mode: 'Markdown', ...Markup.keyboard([['❌ Bekor qilish']]).resize() }
+    );
+  }
+
   // 🔍 User topish
   if (text === '🔍 User topish') {
     adminState.set(adminId, { action: 'search_user' });
@@ -326,7 +411,13 @@ async function handleAdmin(ctx, bot) {
 
   // 🔄 IG Session
   if (text === '🔄 IG Session') {
-    const msg = await ctx.reply('🔄 Instagram ga qayta ulanilmoqda...');
+    const username = await getConnectedUsername();
+    if (!username) {
+      return ctx.reply(
+        '❌ Hali Instagram akkaunt ulanmagan.\n"🔗 Instagram ulash" tugmasidan foydalaning.'
+      );
+    }
+    const msg = await ctx.reply(`🔄 @${username} ga qayta ulanilmoqda...`);
     try {
       await loginInstagram(true);
       await ctx.telegram.editMessageText(
@@ -460,6 +551,29 @@ async function handleAdminCallback(ctx) {
     await Channel.deleteOne({ chatId });
     await ctx.answerCbQuery('🗑 Kanal o\'chirildi');
     return showChannelsList(ctx);
+  }
+
+  // ✅ Instagram ulash — Gmail orqali tasdiqlash: HA
+  if (data === 'igconnect_gmail_yes') {
+    const state = adminState.get(adminId);
+    await ctx.answerCbQuery();
+    if (!state || state.action !== 'ig_connect_gmail_choice') {
+      return ctx.reply('❌ Sessiya eskirgan. "🔗 Instagram ulash" dan qayta boshlang.');
+    }
+    adminState.set(adminId, { action: 'ig_connect_gmail_address', igUsername: state.igUsername, igPassword: state.igPassword });
+    return ctx.reply('📧 Gmail manzilingizni kiriting:');
+  }
+
+  // ❌ Instagram ulash — Gmail orqali tasdiqlash: YO'Q
+  if (data === 'igconnect_gmail_no') {
+    const state = adminState.get(adminId);
+    await ctx.answerCbQuery();
+    if (!state || state.action !== 'ig_connect_gmail_choice') {
+      return ctx.reply('❌ Sessiya eskirgan. "🔗 Instagram ulash" dan qayta boshlang.');
+    }
+    adminState.delete(adminId);
+    await saveIgAccount({ igUsername: state.igUsername, igPassword: state.igPassword, gmailAddress: '', gmailAppPassword: '' });
+    return attemptIgConnect(ctx);
   }
 
   ctx.answerCbQuery();
